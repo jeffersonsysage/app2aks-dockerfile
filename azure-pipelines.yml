@@ -1,84 +1,96 @@
-trigger:
-- main  # 自动触发 main 分支的代码变动
+# Deploy to Azure Kubernetes Service
+# Build and push image to Azure Container Registry; Deploy to Azure Kubernetes Service
+# https://docs.microsoft.com/azure/devops/pipelines/languages/docker
 
-pool:
-  vmImage: 'ubuntu-latest'
+trigger: none
+
+resources:
+- repo: self
 
 variables:
-  # Azure 容器注册表名称（不包含 .azurecr.io 后缀）
-  ACR_NAME: "<your-acr-name>"
-  # 镜像标签，使用唯一构建 ID
-  IMAGE_TAG: "v$(Build.BuildId)"
-  # Kubernetes 命名空间
-  K8S_NAMESPACE: "default"
+
+  # Container registry service connection established during pipeline creation
+  dockerRegistryServiceConnection: 'a808765f-caee-4ae6-957c-237e4cb84861'
+  frontend-imageRepository: 'frontend'
+  backend-imageRepository: 'backend'
+  containerRegistry: 'akslabacr1204.azurecr.io'
+  frontend-dockerfilePath: '**/frontend/Dockerfile'
+  backend-dockerfilePath: '**/backend/Dockerfile'
+  tag: '$(Build.BuildId)'
+  imagePullSecret: 'akslabacr1204ee49-auth'
+
+  # Agent VM image name
+  vmImageName: 'ubuntu-latest'
 
 stages:
-- stage: BuildAndPush
-  displayName: "Build and Push Docker Images"
+- stage: Build
+  displayName: Build stage
   jobs:
   - job: Build
-    displayName: "Build and Push Docker Images to ACR"
+    displayName: Build
+    pool:
+      vmImage: $(vmImageName)
     steps:
-    # 1. 检出代码
-    - task: Checkout@1
-      displayName: "Checkout code"
-
-    # 2. 登录到 ACR
-    - task: AzureCLI@2
-      displayName: "Log in to Azure Container Registry"
-      inputs:
-        azureSubscription: "<your-service-connection-name>"  # 替换为 ACR 的服务连接名称
-        scriptType: bash
-        scriptLocation: inlineScript
-        inlineScript: |
-          az acr login --name $(ACR_NAME)
-
-    # 3. 构建并推送前端镜像
     - task: Docker@2
-      displayName: "Build and Push Frontend Docker Image"
+      displayName: Build frontend and push an image to container registry
       inputs:
-        containerRegistry: "<your-service-connection-name>"
-        repository: "$(ACR_NAME).azurecr.io/frontend"
-        command: "buildAndPush"
-        Dockerfile: "frontend/Dockerfile"  # 前端 Dockerfile 路径
-        tags: "$(IMAGE_TAG)"
-
-    # 4. 构建并推送后端镜像
+        command: buildAndPush
+        repository: $(frontend-imageRepository)
+        dockerfile: $(frontend-dockerfilePath)
+        containerRegistry: $(dockerRegistryServiceConnection)
+        tags: |
+          $(tag)
     - task: Docker@2
-      displayName: "Build and Push Backend Docker Image"
+      displayName: Build backend and push an image to container registry
       inputs:
-        containerRegistry: "<your-service-connection-name>"
-        repository: "$(ACR_NAME).azurecr.io/backend"
-        command: "buildAndPush"
-        Dockerfile: "backend/Dockerfile"  # 后端 Dockerfile 路径
-        tags: "$(IMAGE_TAG)"
+        command: buildAndPush
+        repository: $(backend-imageRepository)
+        dockerfile: $(backend-dockerfilePath)
+        containerRegistry: $(dockerRegistryServiceConnection)
+        tags: |
+          $(tag)
+
+    - publish: manifests
+      artifact: manifests
 
 - stage: Deploy
-  displayName: "Deploy to AKS"
-  dependsOn: BuildAndPush  # 确保部署阶段在镜像构建完成后执行
-  jobs:
-  - job: Deploy
-    displayName: "Deploy Applications to AKS"
-    steps:
-    # 1. 登录到 AKS 集群
-    - task: AzureCLI@2
-      displayName: "Log in to AKS"
-      inputs:
-        azureSubscription: "<your-service-connection-name>"  # 替换为 AKS 的服务连接名称
-        scriptType: bash
-        scriptLocation: inlineScript
-        inlineScript: |
-          az aks get-credentials --resource-group <your-resource-group> --name <your-aks-cluster-name>
+  displayName: Deploy stage
+  dependsOn: Build
 
-    # 2. 部署到 AKS
-    - task: KubernetesManifest@0
-      displayName: "Deploy to AKS"
-      inputs:
-        kubernetesServiceConnection: "<your-aks-service-connection>"
-        namespace: $(K8S_NAMESPACE)
-        manifests: |
-          manifests/frontend-deployment.yaml
-          manifests/backend-deployment.yaml
-        containers: |
-          frontend:$(ACR_NAME).azurecr.io/frontend:$(IMAGE_TAG)
-          backend:$(ACR_NAME).azurecr.io/backend:$(IMAGE_TAG)
+  jobs:
+  - deployment: Deploy
+    displayName: Deploy
+    pool:
+      vmImage: $(vmImageName)
+    environment: 'app2aksdockerfile.default'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: KubernetesManifest@0
+            displayName: Create imagePullSecret
+            inputs:
+              action: createSecret
+              secretName: $(imagePullSecret)
+              dockerRegistryEndpoint: $(dockerRegistryServiceConnection)
+
+          - task: KubernetesManifest@0
+            displayName: Deploy to Kubernetes cluster
+            inputs:
+              action: deploy
+              manifests: |
+                $(Pipeline.Workspace)/manifests/frontend-deployment.yml
+                $(Pipeline.Workspace)/manifests/backend-deployment.yml
+              imagePullSecrets: |
+                $(imagePullSecret)
+              containers: |
+                $(containerRegistry)/$(frontend-imageRepository):$(tag)
+                $(containerRegistry)/$(backend-imageRepository):$(tag)
+          
+          - task: KubernetesManifest@0
+            displayName: Deploy Ingress
+            inputs:
+              action: deploy
+              namespace: default
+              manifests: |
+                $(Pipeline.Workspace)/manifests/ingress.yml
